@@ -1,0 +1,9 @@
+# 操作系统产生的杂项文件
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 编辑器 / 调试临时文件
+*.log
+_*.js
+_*.png

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SOLARIS · 太阳系探索系统</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<canvas id="scene"></canvas>
+
+<!-- 画面叠加的装饰层 -->
+<div class="fx-vignette"></div>
+<div class="fx-scanlines"></div>
+
+<!-- 左上：标题 -->
+<header class="hud-title">
+  <div class="title-mark"><span></span></div>
+  <div class="title-text">
+    <h1>SOLARIS</h1>
+    <p>太阳系探索系统 / SOLAR SYSTEM EXPLORER</p>
+  </div>
+</header>
+
+<!-- 左侧：天体索引 -->
+<aside class="hud-left">
+  <div class="panel-label"><i></i>天体索引 / INDEX</div>
+  <nav id="planet-list" class="planet-list"></nav>
+</aside>
+
+<!-- 右上：控制台 -->
+<section class="hud-right">
+  <div class="panel-label"><i></i>控制台 / CONTROL</div>
+
+  <div class="ctrl">
+    <div class="ctrl-row">
+      <span>时间流速</span>
+      <span id="speed-value" class="ctrl-value">1.0×</span>
+    </div>
+    <input type="range" id="speed-range" min="0" max="4" step="0.1" value="1">
+  </div>
+
+  <div class="btn-grid">
+    <button id="btn-pause" class="hud-btn"><span class="btn-label">暂停</span></button>
+    <button id="btn-orbits" class="hud-btn is-on">轨道线</button>
+    <button id="btn-glow" class="hud-btn is-on">辉光</button>
+    <button id="btn-reset" class="hud-btn">重置视角</button>
+  </div>
+</section>
+
+<!-- 右侧：天体档案 -->
+<aside id="info" class="info">
+  <button id="btn-close-info" class="info-close" aria-label="关闭">✕</button>
+  <div id="info-body" class="info-body"></div>
+</aside>
+
+<!-- 追踪状态 -->
+<button id="follow" class="follow">
+  <span class="follow-dot"></span>
+  <span class="follow-txt">追踪 <b id="follow-name">—</b></span>
+  <span class="follow-x">解除</span>
+</button>
+
+<!-- 悬停名称标签 -->
+<div id="tooltip" class="tooltip"></div>
+
+<!-- 底部操作提示 -->
+<div class="hud-hint">
+  <span><kbd>拖拽</kbd>旋转视角</span>
+  <span><kbd>滚轮</kbd>缩放</span>
+  <span><kbd>点击天体</kbd>查看档案</span>
+  <span><kbd>空格</kbd>暂停</span>
+  <span><kbd>Esc</kbd>退出</span>
+</div>
+
+<!-- 加载屏 -->
+<div id="loading" class="loading">
+  <div class="loading-inner">
+    <div class="loading-ring"><i></i></div>
+    <h2>SOLARIS</h2>
+    <p class="loading-sub">正在演算行星地表纹理…</p>
+    <div class="loading-track"><div id="loading-bar" class="loading-bar"></div></div>
+    <div class="loading-meta">
+      <span id="loading-label">初始化</span>
+      <span id="loading-pct">0%</span>
+    </div>
+  </div>
+</div>
+
+<!-- 依赖：three.js 及官方扩展（均已本地化，可离线运行） -->
+<script src="lib/three.min.js"></script>
+<script src="lib/CopyShader.js"></script>
+<script src="lib/LuminosityHighPassShader.js"></script>
+<script src="lib/Pass.js"></script>
+<script src="lib/ShaderPass.js"></script>
+<script src="lib/EffectComposer.js"></script>
+<script src="lib/RenderPass.js"></script>
+<script src="lib/UnrealBloomPass.js"></script>
+<script src="lib/OrbitControls.js"></script>
+<script src="js/data.js"></script>
+<script src="js/textures.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
