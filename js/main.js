@@ -25,6 +25,9 @@
     paused: false,
     timeScale: 1,
     showOrbits: true,
+    /* 天球壳的开关。刻意和 showOrbits 分开记：两个模式各记各的，
+       在恒星模式关掉星座线不该顺手把太阳系的轨道线也关了。 */
+    showSky: true,
     bloomOn: true,
     hovered: null,
     focusRef: null,
@@ -39,7 +42,11 @@
      太阳系那套 0.1 / 4000 的视锥富余得多，动它只会白白引入深度精度问题。 */
   const MODE_VIEW = {
     solar: { home: new THREE.Vector3(0, 55, 118), minDist: 1.1, maxDist: 620 },
-    star:  { home: new THREE.Vector3(0, 42, 96),  minDist: 3.0, maxDist: 400 }
+    /* 280 < 壳半径 300：相机永远待在壳**里**。壳星和星座线都是
+       depthWrite: false，没有东西遮挡远半球，一出去就看到前后两层星叠着
+       同一个星座的两个副本，星密度凭空翻倍。留 20 的余量，免得贴到壳面
+       上时内壁摊成一张平面。 */
+    star:  { home: new THREE.Vector3(0, 42, 96),  minDist: 3.0, maxDist: 280 }
   };
 
   let renderer, scene, camera, controls, composer, bloomPass, clock;
@@ -47,6 +54,13 @@
   let sunRef = null;
   let sunStarRef = null;       // 恒星世界里原点上的那个太阳标记
   let worldSolar, worldStars;
+  /* 点精灵共用的一张纹理。makeGlowTexture 是逐像素循环且不缓存，
+     内层 5 个桶、太阳辉光、壳层 4 个桶全用这一张 —— 调第二次就是白烧一次。 */
+  let starGlowTex = null;
+  let skyGroup = null;         // 天球壳（壳星 + 星座线），挂在 worldStars 下
+  let skyLines = null;         // 壳上那 743 段星座线，开关只切它
+  let skyConstellations = [];  // 88 个星座的中心方向/中文名/最亮星等，构建时算好
+  let skyLabelEls = null;      // 屏幕上那 8 个名字标签，DOM 池（见 updateSkyLayer）
 
   const planets = [];          // 行星运行时对象
   const moonRefs = [];         // 所有卫星运行时对象
@@ -612,17 +626,21 @@
     return out.set(r * cd * Math.cos(ra), r * Math.sin(dec), -r * cd * Math.sin(ra));
   }
 
-  function magBucketOf(mag) {
+  /* 星等落进哪个桶。内层用 STAR_MAG_BUCKETS，天球壳用 SKY_MAG_BUCKETS ——
+     两组桶的尺寸量纲不通用（一个按透视倒推、一个是纯像素），所以桶表当参数传。 */
+  function magBucketOf(mag, buckets) {
     const m = (mag === null || mag === undefined || !isFinite(mag)) ? Infinity : mag;
-    const i = STAR_MAG_BUCKETS.findIndex(b => m < b.max);
-    return i < 0 ? STAR_MAG_BUCKETS.length - 1 : i;
+    const i = buckets.findIndex(b => m < b.max);
+    return i < 0 ? buckets.length - 1 : i;
   }
 
   function buildStarWorld() {
     /* 全项目最大的性能陷阱就在这一行：makeGlowTexture 是 256×256 的逐像素
        循环，而且不缓存。给 141 颗星各调一次就是约 3700 万次像素运算、
-       几十 MB 的画布，会卡死好几秒。只调这一次，5 个 Points 和太阳辉光共用。 */
-    const glowTex = TexGen.makeGlowTexture([255, 255, 255], 2.2);
+       几十 MB 的画布，会卡死好几秒。只调这一次，5 个 Points、太阳辉光和
+       后面的天球壳共用 —— 提到模块作用域就是为了让 buildSkyShell 也拿得到。 */
+    starGlowTex = TexGen.makeGlowTexture([255, 255, 255], 2.2);
+    const glowTex = starGlowTex;
     const c = new THREE.Color();
     const hsl = { h: 0, s: 0, l: 0 };
 
@@ -630,7 +648,7 @@
        所以光谱色能进顶点色、星等不能进大小 —— 只能按星等分桶，一组一尺寸。
        5 个桶 = 5 次 drawcall。 */
     const groups = STAR_MAG_BUCKETS.map(() => []);
-    NEARBY_STARS.forEach(s => groups[magBucketOf(s.mag)].push(s));
+    NEARBY_STARS.forEach(s => groups[magBucketOf(s.mag, STAR_MAG_BUCKETS)].push(s));
 
     groups.forEach((list, bi) => {
       if (!list.length) return;
@@ -744,6 +762,202 @@
     /* 射线用的是 matrixWorld，而它要到渲染时才更新，偏偏悬停检测跑在
        渲染前面。不先算这一遍，第一帧所有拾取球都还堆在原点。 */
     worldStars.updateMatrixWorld(true);
+  }
+
+  /* 88 个星座的中文名，键是 sky.js 里 CONSTELLATION_LINES 的键（IAU 三字母缩写）。
+
+     写在这里而不是 sky.js：那个文件是烘好的数据成品，头部注释写明了复现方法，
+     手写内容下次重新生成会被冲掉。
+
+     几处译名有分歧的，这里采用的是国家天文名词审定委员会那套：
+     蝘蜓座（不是「蝙蝠座」）、剑鱼座（不是「箭鱼座」）、
+     印第安座（不是「印地安座」）、唧筒座（不是「唢呐座」）。 */
+  const SKY_CONSTELLATION_CN = {
+    And: '仙女座', Ant: '唧筒座', Aps: '天燕座', Aqr: '宝瓶座', Aql: '天鹰座',
+    Ara: '天坛座', Ari: '白羊座', Aur: '御夫座', Boo: '牧夫座', Cae: '雕具座',
+    Cam: '鹿豹座', Cnc: '巨蟹座', CVn: '猎犬座', CMa: '大犬座', CMi: '小犬座',
+    Cap: '摩羯座', Car: '船底座', Cas: '仙后座', Cen: '半人马座', Cep: '仙王座',
+    Cet: '鲸鱼座', Cha: '蝘蜓座', Cir: '圆规座', Col: '天鸽座', Com: '后发座',
+    CrA: '南冕座', CrB: '北冕座', Crv: '乌鸦座', Crt: '巨爵座', Cru: '南十字座',
+    Cyg: '天鹅座', Del: '海豚座', Dor: '剑鱼座', Dra: '天龙座', Equ: '小马座',
+    Eri: '波江座', For: '天炉座', Gem: '双子座', Gru: '天鹤座', Her: '武仙座',
+    Hor: '时钟座', Hya: '长蛇座', Hyi: '水蛇座', Ind: '印第安座', Lac: '蝎虎座',
+    Leo: '狮子座', LMi: '小狮座', Lep: '天兔座', Lib: '天秤座', Lup: '豺狼座',
+    Lyn: '天猫座', Lyr: '天琴座', Men: '山案座', Mic: '显微镜座', Mon: '麒麟座',
+    Mus: '苍蝇座', Nor: '矩尺座', Oct: '南极座', Oph: '蛇夫座', Ori: '猎户座',
+    Pav: '孔雀座', Peg: '飞马座', Per: '英仙座', Phe: '凤凰座', Pic: '绘架座',
+    Psc: '双鱼座', PsA: '南鱼座', Pup: '船尾座', Pyx: '罗盘座', Ret: '网罟座',
+    Sge: '天箭座', Sgr: '人马座', Sco: '天蝎座', Scl: '玉夫座', Sct: '盾牌座',
+    Ser: '巨蛇座', Sex: '六分仪座', Tau: '金牛座', Tel: '望远镜座', Tri: '三角座',
+    TrA: '南三角座', Tuc: '杜鹃座', UMa: '大熊座', UMi: '小熊座', Vel: '船帆座',
+    Vir: '室女座', Vol: '飞鱼座', Vul: '狐狸座'
+  };
+
+  /* 天球壳上的位置：方向照搬，距离一律 SKY_RADIUS。
+     和 starPosition 是同一套赤道坐标约定（场景里 XZ 面是天赤道、+Y 指北天极，
+     最后一项取负的理由见那边），差别只在距离 —— 那边是压缩后的真实距离，
+     这边是恒定半径。sky.js 里的 ra 单位是**度**，不是 HYG 那种小时。 */
+  function skyPositionOf(ra, dec, out) {
+    const a = ra * Math.PI / 180;
+    const d = dec * Math.PI / 180;
+    const cd = Math.cos(d);
+    return out.set(SKY_RADIUS * cd * Math.cos(a),
+                   SKY_RADIUS * Math.sin(d),
+                   -SKY_RADIUS * cd * Math.sin(a));
+  }
+
+  /* 天球壳：内层那 141 颗星按真实三维距离摆，于是这一层里凑不出任何一个
+     完整的星座 —— 猎户座那七颗彼此相距几百上千光年，在三维空间里根本不是
+     邻居，何况距离还走了一道非线性压缩。星座只在天球上成立。
+
+     所以这里补一层半径固定的球面：星只按**方向**落位，距离一律忽略，
+     连线画在球面上。它和内层是各自独立的两张图，**不会重合**——同一个
+     天狼星，内层那个是「8.6 光年外的一个真实位置」，壳上那个是「天上那个
+     方向」，从离开原点的相机看过去，两者能差出一百多度。这不是 bug，
+     是「距离」这件事本身的可视化；壳的立论不是内层的投影演示，而是
+     「一张完整的星图」。所以壳做得明显更暗更小，退成背景天幕。 */
+  function buildSkyShell() {
+    skyGroup = new THREE.Group();
+    /* 挂在 worldStars 下而不是 scene：切回太阳系时 worldStars.visible = false
+       会把它一起收走，少一处要在 applyMode 里维护的状态。 */
+    worldStars.add(skyGroup);
+
+    const c = new THREE.Color();
+
+    /* 按星等分桶，理由和内层一样（PointsMaterial 的 size 整组共用，只有
+       vertexColors 能逐顶点）。桶值来自 sky.js —— 注意那组数是**纯像素**。 */
+    const groups = SKY_MAG_BUCKETS.map(() => []);
+    SKY_STARS_RAW.forEach((s, i) => {
+      groups[magBucketOf(s[3], SKY_MAG_BUCKETS)].push(i);   // s = [hip, ra, dec, mag, bv]
+    });
+
+    groups.forEach((list, bi) => {
+      if (!list.length) return;
+      const cfg = SKY_MAG_BUCKETS[bi];
+      const pos = new Float32Array(list.length * 3);
+      const col = new Float32Array(list.length * 3);
+
+      list.forEach((si, k) => {
+        const s = SKY_STARS_RAW[si];
+        const mag = s[3];
+        skyPositionOf(s[1], s[2], _v1);
+        pos[k * 3] = _v1.x; pos[k * 3 + 1] = _v1.y; pos[k * 3 + 2] = _v1.z;
+
+        c.setHex(skyColorFromBV(s[4]));
+        /* 整层压暗，让它退到内层后面当天幕。压的是整层而不是某一类星，
+           所以光谱色的相对关系一个字没动。
+
+           压到 0.85 而不是更狠：743 条线是一笔连到底的实线，3~8px 的孤立
+           暗点根本压不住它 —— 压过头就会变成「线浮在黑底上、端头的星看不
+           见」，像凭空画的划痕而不是星座。两边得在同一档亮度上，线才是
+           「把星连起来」的那笔。 */
+        c.multiplyScalar(0.85);
+        /* 桶内再按星等的残余量做亮度微调，把几级台阶抹成连续的（照抄内层做法） */
+        const lo = bi === 0 ? -1.6 : SKY_MAG_BUCKETS[bi - 1].max;
+        const t = Math.min(Math.max((mag - lo) / (cfg.max - lo), 0), 1);
+        c.multiplyScalar(1.2 - 0.4 * t);
+
+        col[k * 3] = c.r; col[k * 3 + 1] = c.g; col[k * 3 + 2] = c.b;
+      });
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+      skyGroup.add(new THREE.Points(geo, new THREE.PointsMaterial({
+        size: cfg.size,
+        map: starGlowTex,
+        vertexColors: true, transparent: true,
+        depthWrite: false, blending: THREE.AdditiveBlending,
+        /* 关键区别：壳层不吃透视。gl_PointSize 直接等于 size，
+           相机在壳内怎么走星都一样大 —— 天幕是投影，本来就不该近大远小。
+           副作用是这里的 size 是纯 CSS 像素，和内层那组倒推值不通用。 */
+        sizeAttenuation: false
+      })));
+    });
+
+    /* 星座线。743 段合成一个 LineSegments，1 次 drawcall。
+
+       ⚠️ 不设 linewidth：WebGL 下大于 1 的线宽在绝大多数驱动上被忽略
+       （Windows 走 ANGLE/D3D11 时 ALIASED_LINE_WIDTH_RANGE 就是 [1,1]），
+       写了也是白写。想更粗只能把线扩成三角形条带，不值得。
+
+       材质与壳星同款（加法混合 + depthWrite: false）：全场景的点都是
+       depthWrite: false，而所有 Points 的原点都在 (0,0,0)，排序拿的是原点的
+       视深，也就是说它们彼此的先后顺序是任意的。加法可交换、又没人写深度，
+       所以看不出问题 —— 换成不透明材质立刻显形。 */
+    const segs = [];
+    Object.keys(CONSTELLATION_LINES).forEach(con => {
+      CONSTELLATION_LINES[con].forEach(line => {
+        for (let i = 0; i < line.length - 1; i++) {
+          if (line[i] !== line[i + 1]) segs.push(line[i], line[i + 1]);
+        }
+      });
+    });
+
+    const lpos = new Float32Array(segs.length * 3);
+    /* 逐顶点的淡出系数，只存灰度（r=g=b=f）。线材质自带 color 0x25a0b8，
+       basic shader 里最终色是 material.color × vColor，正好等于「主色 × 系数」；
+       顶点色里再存一遍颜色就会乘两遍。 */
+    const lcol = new Float32Array(segs.length * 3).fill(1);
+    segs.forEach((si, k) => {
+      const s = SKY_STARS_RAW[si];
+      skyPositionOf(s[1], s[2], _v1);
+      lpos[k * 3] = _v1.x; lpos[k * 3 + 1] = _v1.y; lpos[k * 3 + 2] = _v1.z;
+    });
+
+    const lgeo = new THREE.BufferGeometry();
+    lgeo.setAttribute('position', new THREE.BufferAttribute(lpos, 3));
+    lgeo.setAttribute('color', new THREE.BufferAttribute(lcol, 3));
+    skyLines = new THREE.LineSegments(lgeo, new THREE.LineBasicMaterial({
+      color: 0x25a0b8,          // 项目主色 #5ee7ff 压到约四成亮度
+      /* 0.3 而不是 0.5：加法混合下线条叠加处会自己变亮，0.5 时线的视觉重量
+         压过了它连的那些星（星是暗的孤立点，线是连续的）。调亮壳星之外再
+         把线压下来，两者才在同一档上。 */
+      transparent: true, opacity: 0.3,
+      /* 顶点色由 updateSkyLayer 每帧按「离视野中心多远」写进去，屏幕边缘的
+         线因此淡出（88 个星座铺满视野会糊成一张网）。加法混合下颜色暗就是
+         透明，所以不需要真正的 alpha 顶点色 —— LineBasicMaterial 的顶点色
+         只有 RGB，本来也给不了 alpha。 */
+      vertexColors: true,
+      depthWrite: false, blending: THREE.AdditiveBlending
+    }));
+    skyGroup.add(skyLines);
+
+    /* 每个星座的中心方向 + 最亮成员星等，给屏幕上的名字用。
+
+       中心取成员方向的**向量平均**再单位化 —— 球面上的中心不能用经纬度各自
+       平均，跨 0° 经线的那几个会飞到对面去。同一个下标会在多条折线里重复
+       出现（折线是从作者数据里原样切的段），所以先去重再加：不然出现次数
+       多的那颗星会把中心往自己那边拽。最亮成员留着给标签排序 —— 否则一个
+       5 等的小星座正对着屏幕中心时，会把大熊座挤掉，而人认得出的正是后者。 */
+    skyConstellations = [];
+    Object.keys(CONSTELLATION_LINES).forEach(con => {
+      const sum = new THREE.Vector3();
+      const seen = new Set();
+      let mag = 99;
+      CONSTELLATION_LINES[con].forEach(line => line.forEach(si => {
+        if (seen.has(si)) return;
+        seen.add(si);
+        const s = SKY_STARS_RAW[si];
+        skyPositionOf(s[1], s[2], _v2);
+        sum.add(_v2);
+        if (s[3] < mag) mag = s[3];
+      }));
+      if (sum.lengthSq() === 0) return;
+      skyConstellations.push({
+        dir: sum.normalize(),
+        name: SKY_CONSTELLATION_CN[con] || con,
+        mag
+      });
+    });
+
+    /* 壳层**不配拾取球**：1655 个球不划算，而且壳上的位置是投影不是真实
+       位置，点它没有意义。它不进 starPickables，而 Raycaster 只测那个数组，
+       所以点壳上的星会自然穿透到内层 —— 不需要额外写穿透逻辑。
+       别「顺手补上拾取」：真补了，壳星没有 data.radius，focusDistanceOf 会
+       算出 NaN 灌进 camera.position，整个画面会黑掉。 */
+    skyGroup.updateMatrixWorld(true);
   }
 
   /* ============================================================
@@ -1008,9 +1222,10 @@
     worldSolar.visible = mode === 'solar';
     worldStars.visible = mode === 'star';
 
-    /* 内层假星场在恒星模式必须藏起来：真星最远才 125 单位，而假星铺在
-       420–900 的球壳上，两者会混进同一片天区，「每颗星的方位都与真实星空
-       一致」这件事就说不清了。外层那圈银河带留着当深空底。 */
+    /* 内层假星场在恒星模式必须藏起来。理由加了天球壳之后变了：原先是因为
+       「真星最远才 125 单位，而假星铺在 420–900，会混进同一片天区」；
+       现在壳层本身就是真实星空的投影，再叠 2600 个随机假星上去，
+       743 条星座线就淹没在噪点里了。外层那圈银河带留着当深空底。 */
     if (starField) starField.visible = mode === 'solar';
 
     const view = MODE_VIEW[mode];
@@ -1034,6 +1249,21 @@
       if (span) span.textContent = mode === 'solar' ? '天体索引 / INDEX' : '邻近恒星 / NEARBY';
     }
     if (dom.listCredit) dom.listCredit.hidden = mode !== 'star';
+
+    /* 天球壳的标注。它只在恒星模式有意义 —— 太阳系那边压根没有壳。
+       「从太阳看出去」这几个字不是修辞：壳上的位置是从原点投影的，
+       而相机永远在原点之外，所以两层对不上是必然的，不是画错了。 */
+    if (dom.listNote) dom.listNote.hidden = mode !== 'star';
+
+    /* 星座线和轨道线两只按钮在任一模式下**只出现一个**：恒星模式露星座线，
+       太阳系露轨道线。轨道线那圈挂在 worldSolar 里，恒星模式下它跟着一起
+       藏了，按钮留着也是按下去毫无反应 —— 那比没有按钮更让人以为坏了。 */
+    if (dom.btnConstel) {
+      dom.btnConstel.hidden = mode !== 'star';
+      dom.btnConstel.classList.toggle('is-on', state.showSky);
+    }
+    if (dom.btnOrbits) dom.btnOrbits.hidden = mode === 'star';
+    if (skyGroup) skyGroup.visible = state.showSky;
   }
 
   /* ============================================================
@@ -1223,7 +1453,11 @@
     // 星空背景两个模式共用，永远转
     if (starField) {
       starField.rotation.y += 0.0035 * dt;
-      starFieldFar.rotation.y -= 0.0018 * dt;
+      /* 那条银河带在恒星模式停下。它铺在 900–1700、y 按 0.55 压扁 ——
+         压的是天赤道面，而真银河在人马座方向、和赤道面差着约 60°。
+         内层 141 颗太稀疏，这个错一直没暴露；壳上 1655 颗会第一次把
+         真的银河带画出来，两条带子差着角度一起转就露馅了。 */
+      if (state.mode === 'solar') starFieldFar.rotation.y -= 0.0018 * dt;
     }
 
     /* 恒星模式下把太阳系整个冻住：1400 个碎石实例每帧重算矩阵纯属白烧，
@@ -1284,6 +1518,274 @@
     });
   }
 
+  /* ============================================================
+     十五之二、天球壳的每帧维护
+     ============================================================ */
+
+  /* 两件事：让屏幕边缘的星座线淡出、把星座名贴到屏幕上。放在一起是因为
+     两者共用同一个判据 ——「这个方向落在屏幕的什么位置」—— 分开写会各算
+     一遍坐标变换，调阈值时还容易只改一处。 */
+
+  /* 判据是 **r = 归一化屏幕半径**：0 是屏幕正中，1 是屏幕的四条边。
+     注意它是「四条边同时到 1」，也就是在 16:9 上呈椭圆 —— 这才是对的。
+     要是用「离相机中心多少度」那种圆锥判据，同一个角度在宽屏上只压得住
+     上下两边，左右两边一点没动，而「像盖了层网」主要就是左右两边糊。
+
+     rIn 以内满亮、rOut 以外压到 floor，中间走 smoothstep。换算成角度
+     （fov 52°、16:9）：rIn 0.40 约合垂直 ±11°、水平 ±16°；rOut 0.95 约合
+     垂直 ±25°、水平 ±35°，基本贴到屏幕边。 */
+  const FADE_R_IN  = 0.40;
+  const FADE_R_OUT = 0.95;
+  /* 地板压到 0.04 是量出来的，不是拍的：末端那道 gamma 是 pow(x, 0.41666)，
+     它把小值往上抬 —— 线性 0.12 出来是**感知上的 40%**，根本不是「退成暗纹」，
+     边缘照旧是亮的（第一版就是这么翻的车）。要感知降到两成，线性得压到 0.02
+     那个量级。
+
+     代价是 8 位量化：composer 的 render target 是 RGBAFormat + 缺省的
+     UnsignedByteType，而线满亮时的线性值只有 (0.044, 0.188, 0.217) —— 系数
+     到 0.04 附近 R 通道就会被量化成 0。不过 R 只占这条线的一成，掉到 0 之后
+     是 (0, 2, 4) 这种极暗的青，肉眼分不出来；真正会看出来的是「星座在屏幕上
+     移动时亮度一档一档地跳」，而 0.04 这一档的台阶（G 从 1 到 2）在 sRGB 上
+     是 22 → 30，很轻微。 */
+  const FADE_FLOOR = 0.04;
+
+  /* 标签的露面门槛，也是 r：只在屏幕中心这一块之内才出名字。和线条共用
+     同一个 r，线和它的名字才会一起亮一起灭，不会出现屏幕上写着猎户座、
+     猎户座的线却是暗的那种自相矛盾。 */
+  const LABEL_R   = 0.68;
+  const LABEL_MAX = 8;
+  /* 贪心去重用的占位框：中文三字在 11px 下约 60px 宽，留点余量 */
+  const LABEL_W = 78;
+  const LABEL_H = 20;
+  /* 窄屏（竖屏手机那一档）左右两栏就把画面吃得差不多了，名字再铺上去只会
+     盖住星空本身。少给几个。 */
+  const LABEL_MAX_NARROW = 4;
+  const NARROW_W = 700;
+
+  const _camPos  = new THREE.Vector3(NaN, NaN, NaN);
+  const _camQuat = new THREE.Quaternion(NaN, NaN, NaN, NaN);
+  /* 标签的候选池：一次按星座数建好，逐帧复用。每帧现建几十个小对象也能跑，
+     但那是纯垃圾 —— 这些字段连清都不用清，全都会被覆写。 */
+  const _labelPool = [];
+  const _labelHits = [];
+
+  /* projectToScreen 的输出。放模块级而不是返回对象：每帧要算几十次，
+     返回对象就是每帧几十个短命对象。 */
+  let _skyX = 0, _skyY = 0, _skyR = Infinity;
+
+  /** 两端导数为零的平滑插值，免得淡出的边界上出现一条硬边 */
+  function smoothstep(e0, e1, x) {
+    const t = Math.min(Math.max((x - e0) / (e1 - e0), 0), 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  /** 世界坐标 -> 屏幕。结果落在 _skyX / _skyY / _skyR（r 是归一化屏幕半径） */
+  function projectToScreen(worldPoint, tanHalfX, tanHalfY) {
+    /* 相机坐标系里 z < 0 才是前方。这里刻意不用 Vector3.project()：它内部
+       就是两个矩阵乘、中间除以 w，对相机背后的点**不设防** —— w < 0 会把
+       x、y 翻转符号，于是背后的方向看起来「落在屏幕里」，标签会镜像到正前方。 */
+    _v1.copy(worldPoint).sub(camera.position).applyMatrix4(camera.matrixWorldInverse);
+    if (_v1.z > -1e-4) { _skyR = Infinity; return; }
+    const invZ = -1 / _v1.z;
+    const nx = _v1.x * invZ / tanHalfX;
+    const ny = _v1.y * invZ / tanHalfY;
+    _skyR = Math.sqrt(nx * nx + ny * ny);
+    /* 用 window.innerWidth 而不是 canvas.width：后者是设备像素，pixelRatio
+       为 2 时差一倍。 */
+    _skyX = (0.5 + 0.5 * nx) * window.innerWidth;
+    _skyY = (0.5 - 0.5 * ny) * window.innerHeight;
+  }
+
+  function hideSkyLabels() {
+    if (skyLabelEls) skyLabelEls.forEach(el => { el.hidden = true; });
+  }
+
+  /* 面板是压在星空上的深色块（层级 50 起，标签在 25）。名字落到它们底下只
+     会露出半个字 ——「御夫座」变成「夫座」，看着像坏了。与其半遮半掩，不如
+     整个不要：那个星座拖到画面中间来就会有名字。
+
+     判据是「标签的框和面板的框相不相交」，不是「x 在不在两栏之间」。旧的
+     写法假设左栏是贴着左边缘的一条竖栏，可窄屏（≤820px）下它被收成了屏幕
+     底部一条署名空壳（见 style.css 的媒体查询）—— 占的 x 区间还是老样子，
+     于是「两栏」之间的缝只剩 3px，窄屏上一个名字都出不来。
+
+     标题也一起挡：画面左上角就它会压字。
+
+     面板是响应式的，所以每帧量一次。量在写 style 之前，不会触发强制重排。 */
+  let _panelEls = null;
+  let _panelBoxes = null;
+
+  function measurePanels() {
+    if (!_panelEls) {
+      _panelEls = ['.hud-left', '.hud-right', '.hud-title']
+        .map(sel => document.querySelector(sel));
+    }
+    _panelBoxes = _panelEls
+      .map(el => el && el.getBoundingClientRect())
+      .filter(r => r && r.width > 0 && r.height > 0);
+  }
+
+  /* 以投影点为中心、2·halfW 宽 LABEL_H 高的那个框，压在哪块面板上了没有 */
+  function blockedByPanel(cx, cy, halfW) {
+    const l = cx - halfW, r = cx + halfW;
+    const t = cy - LABEL_H * 0.5, b = cy + LABEL_H * 0.5;
+    for (let i = 0; i < _panelBoxes.length; i++) {
+      const p = _panelBoxes[i];
+      if (l < p.right && r > p.left && t < p.bottom && b > p.top) return true;
+    }
+    return false;
+  }
+
+  function updateSkyLayer() {
+    /* 显隐只在这里判一处。applyMode 和「星座线」按钮的回调都只管改 state，
+       不碰 DOM —— 那种「两个地方各改一半」的写法，漏一处就是一个只在特定
+       操作顺序下才现形的 bug。
+
+       switching 也算进来：applyMode 是换场动画**走到一半**才调的，在那之前
+       相机已经拉着飞出去了，而标签是 DOM、不在 worldStars 底下，
+       worldStars.visible = false 收不走它。 */
+    const show = state.booted && !state.switching && state.mode === 'star'
+                 && state.showSky && skyLines && skyGroup && skyGroup.visible;
+    if (dom.skyLabels) dom.skyLabels.hidden = !show;
+    if (!show) { hideSkyLabels(); return; }
+
+    if (!skyLabelEls) {
+      /* DOM 池：一次建满，之后每帧只改文字和 transform。每帧重建元素会一直
+         触发布局，标签本身还会一闪一闪的。 */
+      skyLabelEls = [];
+      for (let i = 0; i < LABEL_MAX; i++) {
+        const el = document.createElement('span');
+        el.className = 'sky-label';
+        el.hidden = true;
+        dom.skyLabels.appendChild(el);
+        skyLabelEls.push(el);
+      }
+    }
+    if (!_labelPool.length) {
+      skyConstellations.forEach(() => _labelPool.push({ name: '', score: 0, x: 0, y: 0 }));
+    }
+
+    /* matrixWorldInverse 只有 Camera 版的 updateMatrixWorld 会同步（Object3D
+       版不管它），而 renderer 要到本帧末尾才渲染。controls.update() 刚改完
+       位姿 —— 这里不补一次，这一帧读到的全是上一帧的相机。 */
+    camera.updateMatrixWorld();
+
+    /* 相机位姿一个字都没变就整块跳过。画面静止时这里是空转。
+       这里刻意不照抄悬停检测那套「隔 0.05s」：那是为了省射线求交，而这块
+       是纯算术 —— 更关键的是阻尼松手之后相机还要滑半秒，20Hz 会让标签
+       一格一格地跳，而标签是钉在点上的，跳一格就是几十像素。 */
+    if (_camPos.distanceToSquared(camera.position) < 1e-4 &&
+        Math.abs(1 - Math.abs(_camQuat.dot(camera.quaternion))) < 1e-7) return;
+    _camPos.copy(camera.position);
+    _camQuat.copy(camera.quaternion);
+
+    const tanHalfY = Math.tan(camera.fov * Math.PI / 360);
+    const tanHalfX = tanHalfY * camera.aspect;
+    const labelMax = window.innerWidth < NARROW_W ? LABEL_MAX_NARROW : LABEL_MAX;
+    measurePanels();
+
+    /* ---- 一、逐顶点算淡出系数 ----
+
+       为什么不是「一个星座一个系数」：那样代码更短，还能保证线和它的名字
+       一起亮一起灭，但大星座会露馅 —— 长蛇座跨 66°、波江座 37°，中心还在
+       屏幕正中时尾巴早甩到屏幕边上去了，整条按中心的系数亮着，边角那截
+       一点没压住。而「边角不要糊成一张网」正是这一趟要治的东西。
+
+       代价是「有线的星座不一定有名字」：星座中心甩出视野外时名字不出现，
+       可它伸进屏幕里的那截线还是亮的。这在跨度超过视野的那几个（长蛇座）
+       上会碰到，接受 —— 名字要跟着中心走，中心不在屏幕里就没地方放。 */
+    const pos = skyLines.geometry.attributes.position.array;
+    const col = skyLines.geometry.attributes.color.array;
+    const e = camera.matrixWorldInverse.elements;   // 列主序
+    const vN = pos.length / 3;
+
+    for (let i = 0; i < vN; i++) {
+      const i3 = i * 3;
+      const px = pos[i3], py = pos[i3 + 1], pz = pos[i3 + 2];
+      /* 直接做矩阵乘，不走 Vector3.applyMatrix4 —— 每帧一千多次，省掉
+         临时对象的来回拷。w 恒为 1（刚体变换），不用除。 */
+      const ex = e[0] * px + e[4] * py + e[8]  * pz + e[12];
+      const ey = e[1] * px + e[5] * py + e[9]  * pz + e[13];
+      const ez = e[2] * px + e[6] * py + e[10] * pz + e[14];
+
+      /* 相机背后的顶点（ez >= 0）直接给地板。反正看不见，但得给个值 ——
+         留着上一帧的系数会在转头时闪。 */
+      let f = FADE_FLOOR;
+      if (ez < -1e-4) {
+        const invZ = -1 / ez;
+        const nx = ex * invZ / tanHalfX;
+        const ny = ey * invZ / tanHalfY;
+        const r = Math.sqrt(nx * nx + ny * ny);
+        const p = 1 - smoothstep(FADE_R_IN, FADE_R_OUT, r);
+        /* 三次方不是为了「更平滑」，是补末端的 gamma：solarisEncodeSRGB 是
+           pow(x, 0.41666)，线性乘 0.5 出来眼睛看到的还有 0.73 —— 直接拿 p 当
+           系数，淡出会弱到看不出来，然后就会一路把阈值往极端调，连中心也糊。
+           平方补掉一半，三次方才是「中环就已经明显退下去」的手感。 */
+        f = FADE_FLOOR + (1 - FADE_FLOOR) * p * p * p;
+      }
+      col[i3] = col[i3 + 1] = col[i3 + 2] = f;
+    }
+    skyLines.geometry.attributes.color.needsUpdate = true;
+
+    /* ---- 二、星座名：位置照旧按中心算 ---- */
+    _labelHits.length = 0;
+    let slot = 0;
+
+    for (let i = 0; i < skyConstellations.length; i++) {
+      const c = skyConstellations[i];
+
+      projectToScreen(_v2.copy(c.dir).multiplyScalar(SKY_RADIUS), tanHalfX, tanHalfY);
+      if (_skyR > LABEL_R) continue;
+      const p = 1 - smoothstep(FADE_R_IN, FADE_R_OUT, _skyR);
+
+      /* 名字的宽度在这里得估：还没写进 DOM，量不到。中文在 11px 字号、
+         0.14em 字距下大约 13px 一个字，两边各 8px 内边距。估大一点无妨 ——
+         宁可少出一个名字，也不要露出半个字。 */
+      const halfW = (c.name.length * 13 + 18) / 2;
+      if (slot < _labelPool.length && !blockedByPanel(_skyX, _skyY, halfW)) {
+        const hit = _labelPool[slot++];
+        hit.name = c.name;
+        /* 排序分数 = 正对程度 + 一点星等权重。只看正对程度的话，一个 5 等的
+           小星座正对着屏幕中心时会把大熊座挤掉，而人认得出的正是后者。 */
+        hit.score = 0.7 * p + 0.3 * Math.min(Math.max((3.0 - c.mag) / 3.5, 0), 1);
+        hit.x = _skyX;
+        hit.y = _skyY;
+        _labelHits.push(hit);
+      }
+    }
+
+    _labelHits.sort((a, b) => b.score - a.score);
+
+    /* 贪心去重：两个名字挨得太近会叠成一团，谁也看不清。按分数从高到低
+       占位，跟已经选中的撞上就直接不要它。 */
+    let n = 0;
+    for (let i = 0; i < _labelHits.length && n < labelMax; i++) {
+      const hit = _labelHits[i];
+      let clash = false;
+      for (let j = 0; j < n; j++) {
+        const k = _labelHits[j];
+        if (Math.abs(hit.x - k.x) < LABEL_W && Math.abs(hit.y - k.y) < LABEL_H) {
+          clash = true;
+          break;
+        }
+      }
+      if (clash) continue;
+      _labelHits[n++] = hit;   // 就地往前挪，hit 已经取出来了，覆盖不到它
+    }
+
+    for (let i = 0; i < skyLabelEls.length; i++) {
+      const el = skyLabelEls[i];
+      if (i >= n) { el.hidden = true; continue; }
+      const hit = _labelHits[i];
+      if (el.textContent !== hit.name) el.textContent = hit.name;
+      /* transform 而不是 left/top：后者每帧都要重算布局。translate(-50%,-50%)
+         是让元素以自身中心对齐这个点 —— 百分比相对的是元素自己的尺寸。 */
+      el.style.transform =
+        'translate(' + Math.round(hit.x) + 'px,' + Math.round(hit.y) + 'px) translate(-50%,-50%)';
+      el.hidden = false;
+    }
+  }
+
   let hoverTimer = 0;
 
   function animate() {
@@ -1296,6 +1798,9 @@
     updateFocus(dt);
     updateSunGlow();
     if (controls.enabled) controls.update();
+    /* 天球壳的淡出和星座名。放在 controls.update() 之后：它读相机位姿。
+       不隔帧 —— 理由见 updateSkyLayer 里那段。 */
+    updateSkyLayer();
 
     // 悬停检测不需要每帧都做，隔帧执行足够跟手
     hoverTimer += dt;
@@ -1344,11 +1849,24 @@
       dom.speedValue.textContent = state.timeScale.toFixed(1) + '×';
     });
 
-    // 轨道线
+    // 轨道线（太阳系的）
     dom.btnOrbits.addEventListener('click', () => {
       state.showOrbits = !state.showOrbits;
       dom.btnOrbits.classList.toggle('is-on', state.showOrbits);
       orbitLines.forEach(l => (l.visible = state.showOrbits));
+    });
+
+    /* 星座线（只在恒星模式露面）。切的是整个天球壳，不只是线 ——
+       壳和线是一体的，留一层没有线的空壳没什么意义。
+
+       刻意不复用轨道线那只按钮：那样得在 handler 里按模式分流、在 applyMode
+       里同步文案和 is-on、还要记住两套状态，三处都可能出岔子；而"换场后
+       按钮文案没跟上"这类 bug 只在特定操作顺序下才现形。多一个按钮，
+       回归面小得多。 */
+    dom.btnConstel.addEventListener('click', () => {
+      state.showSky = !state.showSky;
+      dom.btnConstel.classList.toggle('is-on', state.showSky);
+      if (skyGroup) skyGroup.visible = state.showSky;
     });
 
     // 辉光
@@ -1429,7 +1947,7 @@
       'scene', 'loading', 'loading-bar', 'loading-label', 'loading-pct',
       'tooltip', 'planet-list', 'info', 'info-body', 'btn-close-info',
       'btn-pause', 'btn-reset', 'btn-orbits', 'btn-glow', 'btn-mode', 'list-label',
-      'list-credit',
+      'list-credit', 'list-note', 'btn-constel', 'sky-labels',
       'speed-range', 'speed-value', 'follow', 'follow-name'
     ].forEach(id => {
       const camel = id.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -1457,6 +1975,7 @@
     createOrbits();
     createAsteroidBelt();
     buildStarWorld();
+    buildSkyShell();
     createHoverRing();
 
     renderList(solarListItems());
@@ -1502,6 +2021,27 @@
       stars: NEARBY_STARS,
       starRefs: STAR_REFS, starPickables, sunStarRef, starPosition,
       STAR_SCALE, STAR_GAMMA,
+      /* 天球壳。skyGroup 是壳星那 4 个 Points 的父节点，skyLineMesh 是那 743 段
+         合一之后的 LineSegments —— 断言要能数出「所有顶点都在半径 300 的球面上」
+         和「每段的两端就是它引用的那两颗星的位置」。 */
+      skyStars: SKY_STARS_RAW, skyLines: CONSTELLATION_LINES,
+      skyGroup, skyLineMesh: skyLines,
+      SKY_RADIUS, SKY_MAG_BUCKETS, skyPositionOf, skyColorFromBV,
+      /* 星座的中心/中文名/顶点区间，淡出和标签都靠它。
+         断言要能核对「88 个键一个不缺」「区间首尾相接铺满整个 buffer」。 */
+      skyConstellations, skyConNames: SKY_CONSTELLATION_CN,
+      /* 淡出的参数和当前标签。skyUpdate 是给断言用的强制刷新：正常路径上
+         「相机没动就跳过」，而脚本改完相机立刻断言，不强制跑一次读到的
+         还是上一帧的值。 */
+      skyFade: { rIn: FADE_R_IN, rOut: FADE_R_OUT, floor: FADE_FLOOR,
+                 labelR: LABEL_R, labelMax: LABEL_MAX,
+                 labelW: LABEL_W, labelH: LABEL_H },
+      skyUpdate: () => {
+        _camPos.set(NaN, NaN, NaN);
+        _camQuat.set(NaN, NaN, NaN, NaN);
+        updateSkyLayer();
+      },
+      skyProject: projectToScreen, skyLabelEls: () => skyLabelEls,
       ring: () => hoverRing
     };
   }

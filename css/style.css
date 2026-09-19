@@ -277,7 +277,23 @@ html, body {
   white-space: nowrap;
 }
 
-/* 恒星数据的署名。HYG 是 CC BY-SA 4.0，署名是许可条件的一部分 */
+/* 天球壳的标注。恒星模式才显示 —— 那层壳和内层是两张**独立**的图
+   （壳按方向投影、恒定半径，内层按真实距离摆），不说明白会以为是同一个
+   东西画了两遍 */
+.list-note {
+  padding: 8px 15px 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  line-height: 1.6;
+  color: var(--text-dim);
+  opacity: 0.6;
+}
+
+.list-note[hidden] { display: none; }
+
+/* 恒星数据的署名。HYG 是 CC BY-SA 4.0，d3-celestial 是 BSD-3-Clause，
+   两处署名都是许可条件的一部分，不是可选项 */
 .list-credit {
   padding: 8px 15px 10px;
   border-top: 1px solid rgba(94, 231, 255, 0.14);
@@ -393,6 +409,11 @@ input[type="range"]::-moz-range-thumb {
   grid-column: 1 / -1;
   letter-spacing: 0.14em;
 }
+
+/* hidden 属性本身只给 display: none，而 .btn-grid 的子项没被显式设过别的
+   display，本来够用 —— 显式写一条，免得以后给 .hud-btn 加上 display: flex
+   时把「隐藏」悄悄弄失效（星座线按钮正是靠 hidden 切换的） */
+.hud-btn[hidden] { display: none; }
 
 /* 入场动画期间锁住模式按钮：那段补间也在直接改 camera.position */
 .hud-btn:disabled {
@@ -715,6 +736,43 @@ a.info-action {
 
 .follow:hover .follow-x { color: #fff; }
 
+/* ---------------- 星座名 ---------------- */
+
+/* 层级 25：和星空同一档，跟着一起被暗角（30）和扫描线（31）罩住，于是
+   不用写任何「躲开面板」的逻辑 —— 那些面板无例外都在 50 以上，名字转到
+   它们后面自然就被盖住。整个是装饰层，底下还要点星，所以不吃指针事件。 */
+.sky-labels {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  overflow: hidden;        /* 贴边的名字不许把滚动条撑出来 */
+  pointer-events: none;
+}
+
+/* 位置整个由 JS 每帧写 transform 决定（含那个 translate(-50%,-50%)，让元素
+   以自身中心对齐），所以这里只留 left/top 的 0 点，不写 transform —— 写了
+   也会被行内样式覆盖掉。用 transform 而不是 left/top 是因为后者每帧都要
+   重算一遍布局。 */
+.sky-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  padding: 2px 8px;
+  /* 一层半透明的底，不是为了好看：名字正好落在它自己那个星座的图形上
+     （中心就是成员的平均方向，本来就该在图形中间），光靠 text-shadow
+     挡不住那条从字缝里穿过去的线，而线在字下面、阴影也在字下面，描边
+     是伪造不出来的。0.62 是能读清、又还透得出星的程度。 */
+  background: rgba(4, 12, 22, 0.62);
+  color: #9fe3f5;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  white-space: nowrap;
+  text-shadow: 0 0 6px rgba(3, 8, 16, 0.9);
+  will-change: transform;
+}
+
+.sky-label[hidden] { display: none; }
+
 /* ---------------- 悬停标签 ---------------- */
 
 .tooltip {
@@ -902,7 +960,8 @@ a.info-action {
   }
   .hud-left::before { display: none; }
   .hud-left .panel-label,
-  .hud-left .planet-list { display: none; }
+  .hud-left .planet-list,
+  .hud-left .list-note { display: none; }
   .list-credit {
     padding: 0;
     border-top: 0;
@@ -916,5 +975,11 @@ a.info-action {
   .hud-hint { left: 18px; bottom: 18px; gap: 12px; }
   .hud-hint span:nth-child(n + 3) { display: none; }
   .info { width: 100vw; }
-  .follow { bottom: 62px; }
+  /* 追踪条抬到署名上方。它原本 bottom: 62px、左右居中，而左栏收成空壳后
+     署名就在左下角（bottom: 52px，两行约 29px 高）—— 一个 682..718、
+     一个 699..728，整段叠着；署名还只有一行那会儿就已经压着 5px 了，
+     只是没看出来。署名是 CC BY-SA 4.0 的许可条件，位置不该跟着交互跑，
+     所以让追踪条挪：96px 是照「署名顶 699、留 15px 间隙、条高 36px」
+     倒推的。它只在追踪时才露面，不追踪时抬多高都不进画面。 */
+  .follow { bottom: 96px; }
 }

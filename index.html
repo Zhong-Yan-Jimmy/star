@@ -30,11 +30,24 @@
 <!-- 左侧：天体索引 -->
 <aside class="hud-left">
   <div class="panel-label" id="list-label"><i></i><span>天体索引 / INDEX</span></div>
+  <!-- 这行是给天球壳做的标注，只在恒星模式显示。措辞要准：「从太阳看出去」
+       是字面意思 —— 壳上的位置是从原点投影的，而相机永远在原点之外，
+       所以内层和壳上那两个副本对不上是必然的，不是画错了 -->
+  <div class="list-note" id="list-note" hidden>
+    外壳 = 从太阳看出去的投影<br>
+    内层 = 真实三维距离
+  </div>
   <nav id="planet-list" class="planet-list"></nav>
-  <!-- HYG 采用 CC BY-SA 4.0，署名是许可条件之一，不是可选项。
-       它只在恒星模式露出来 —— 太阳系那部分数据是手写的，跟它无关 -->
+  <!-- 两处署名都是许可条件，不是可选项。它们只在恒星模式露出来 ——
+       太阳系那部分数据是手写的，跟这两家都无关。
+       分行的依据是**数据从哪来**，不是「恒星 / 星座」：按真实距离摆的那
+       141 颗（左栏标题叫它「邻近恒星」）是 HYG 的，而壳上那 1655 颗和
+       88 个星座的连线都是 d3-celestial 的（见 js/sky.js 头部的复现命令，
+       两个输入文件同源）。按「恒星 / 星座」分会把壳星那一大块漏在两家
+       之外 -->
   <div class="list-credit" id="list-credit" hidden>
-    恒星数据来自 HYG Database<br>CC BY-SA 4.0 · astronexus.com/hyg
+    邻近恒星 · HYG Database · CC BY-SA 4.0<br>
+    天球壳 · d3-celestial · BSD-3-Clause
   </div>
 </aside>
 
@@ -53,6 +66,9 @@
   <div class="btn-grid">
     <!-- 模式切换横跨整行：它不是四个开关里的第五个，而是换掉整个视野的入口 -->
     <button id="btn-mode" class="hud-btn is-wide">邻近恒星</button>
+    <!-- 只在恒星模式露面（applyMode 里切 hidden）。不复用上面那只「轨道线」：
+       同一个位置的按钮在两个模式里做不同的事，读代码的人迟早会踩 -->
+    <button id="btn-constel" class="hud-btn is-wide is-on" hidden>星座线</button>
     <button id="btn-pause" class="hud-btn"><span class="btn-label">暂停</span></button>
     <button id="btn-orbits" class="hud-btn is-on">轨道线</button>
     <button id="btn-glow" class="hud-btn is-on">辉光</button>
@@ -72,6 +88,9 @@
   <span class="follow-txt">追踪 <b id="follow-name">—</b></span>
   <span class="follow-x">解除</span>
 </button>
+
+<!-- 星座名（恒星模式）。内容由 updateSkyLayer 每帧填，最多八个 -->
+<div id="sky-labels" class="sky-labels" hidden></div>
 
 <!-- 悬停名称标签 -->
 <div id="tooltip" class="tooltip"></div>
@@ -110,6 +129,7 @@
 <script src="lib/UnrealBloomPass.js"></script>
 <script src="lib/OrbitControls.js"></script>
 <script src="js/data.js"></script>
+<script src="js/sky.js"></script>
 <script src="js/textures.js"></script>
 <script src="js/main.js"></script>
 </body>
