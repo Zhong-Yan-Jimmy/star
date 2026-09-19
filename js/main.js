@@ -731,6 +731,17 @@
       ? '#' + new THREE.Color(d.color).getHexString()
       : '#5ee7ff';
 
+    /* 地球是全场景里唯一有详细地理版的天体——TERRA 就是从 SOLARIS 派生出去的
+       地球专题。用 <a href> 而不是再接一个 button + JS 跳转：新标签页打开、中键
+       点击、右键「在新标签页中打开」、悬停时看得到去向，浏览器原生全给了。
+       rel="noopener" 不是可选的，少了它 TERRA 那页能通过 window.opener 反向操作
+       这一页。路径是相对的：本地两个目录同在 code/ 下，线上两个站同在
+       <user>.github.io 下，同一条 ../terra/index.html 两边都成立 */
+    const terraLink = d.id === 'earth'
+      ? '<a class="info-action info-action-ext" href="../terra/index.html"' +
+        ' target="_blank" rel="noopener">进入 TERRA · 地理探索 ↗</a>'
+      : '';
+
     dom.infoBody.innerHTML =
       '<div class="info-head" style="--accent:' + rgb + '">' +
         '<div class="info-badge">' + (d.badge || d.type || '') + '</div>' +
@@ -746,7 +757,8 @@
         '<p class="info-desc">' + (d.desc || '') + '</p>' +
       '</div>' +
       highlights +
-      '<button class="info-action" id="btn-go">聚焦观测 →</button>';
+      '<button class="info-action" id="btn-go">聚焦观测 →</button>' +
+      terraLink;
 
     dom.info.classList.add('is-open');
     dom.infoBody.scrollTop = 0;

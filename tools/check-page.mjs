@@ -97,6 +97,46 @@ try {
   ok(!!panel, '点第三个天体，详情面板打开了',
      panel ? panel.slice(0, 56) + '…' : '（页面上没有 .is-open）');
 
+  /* ---- 地球档案里那条去 TERRA 的路 ----
+     按 dataset.id 找而不是按下标：列表里有没有太阳、卫星排在第几位，都是
+     别处决定的事，下标会跟着它们一起漂 */
+  const clickBody = id => page.evaluate(want => {
+    const rows = document.querySelectorAll('.planet-list .p-item');
+    const el = Array.prototype.filter.call(rows, r => r.dataset.id === want)[0];
+    if (el) el.click();
+    return !!el;
+  }, id);
+
+  ok(await clickBody('earth'), '天体索引里有地球这一项');
+  await sleep(1000);
+  const ext = await page.evaluate(() => {
+    const a = document.querySelector('#info-body a.info-action-ext');
+    if (!a) return null;
+    return {
+      href: a.getAttribute('href'),
+      target: a.getAttribute('target'),
+      rel: a.getAttribute('rel'),
+      text: a.textContent.trim(),
+      h: Math.round(a.getBoundingClientRect().height),
+    };
+  });
+  ok(!!ext, '点地球，档案里多出去 TERRA 的入口',
+     ext ? ext.text : '（没找到 a.info-action-ext）');
+  if (ext) {
+    ok(ext.href === '../terra/index.html', 'href 指向 TERRA', ext.href);
+    ok(ext.target === '_blank', '新标签页打开', ext.target);
+    ok(/noopener/.test(ext.rel || ''), 'rel 带 noopener（否则 TERRA 能反向操作这一页）', ext.rel);
+    /* 光看 DOM 里有没有还不够：样式写歪了它也会在，只是看不见 */
+    ok(ext.h > 20, '按钮有实际高度，没有被压扁', ext.h + 'px');
+  }
+
+  /* 反向那半条才是关键：只断言「地球有」的话，把判断写成恒真也能过 */
+  await clickBody('venus');
+  await sleep(1000);
+  const onVenus = await page.evaluate(() =>
+    !!document.querySelector('#info-body a.info-action-ext'));
+  ok(!onVenus, '换回金星，入口不出现——只对地球有');
+
   console.log('\n控制台');
   console.log('─'.repeat(58));
   const real = [...new Set(problems)];

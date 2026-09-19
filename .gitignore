@@ -4,6 +4,9 @@ desktop.ini
 .DS_Store
 
 # 编辑器 / 调试临时文件
+# 下划线开头 = 临时产物。脚本要写成 _*.mjs，因为 node 在没有 package.json
+# 的目录里把 .js 当 CJS 解析，而 tools/ 下的脚本用的都是 import 语法
 *.log
 _*.js
+_*.mjs
 _*.png

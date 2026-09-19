@@ -612,6 +612,16 @@ input[type="range"]::-moz-range-thumb {
   box-shadow: 0 0 30px rgba(94, 231, 255, 0.55);
 }
 
+/* 去 TERRA 的入口。跟上面那个动作共用一套外观，但它是 **去另一个站点**，
+   所以补两件事：<a> 要拿回 button 天生自带的居中与无下划线；两个按钮叠在
+   一起时把 34px 的下边距收掉，否则中间空出一大块 */
+a.info-action {
+  text-align: center;
+  text-decoration: none;
+}
+
+.info-action + .info-action { margin-top: -10px; }
+
 /* ---------------- 追踪状态 ---------------- */
 
 .follow {
