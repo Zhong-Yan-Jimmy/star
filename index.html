@@ -29,8 +29,13 @@
 
 <!-- 左侧：天体索引 -->
 <aside class="hud-left">
-  <div class="panel-label"><i></i>天体索引 / INDEX</div>
+  <div class="panel-label" id="list-label"><i></i><span>天体索引 / INDEX</span></div>
   <nav id="planet-list" class="planet-list"></nav>
+  <!-- HYG 采用 CC BY-SA 4.0，署名是许可条件之一，不是可选项。
+       它只在恒星模式露出来 —— 太阳系那部分数据是手写的，跟它无关 -->
+  <div class="list-credit" id="list-credit" hidden>
+    恒星数据来自 HYG Database<br>CC BY-SA 4.0 · astronexus.com/hyg
+  </div>
 </aside>
 
 <!-- 右上：控制台 -->
@@ -46,6 +51,8 @@
   </div>
 
   <div class="btn-grid">
+    <!-- 模式切换横跨整行：它不是四个开关里的第五个，而是换掉整个视野的入口 -->
+    <button id="btn-mode" class="hud-btn is-wide">邻近恒星</button>
     <button id="btn-pause" class="hud-btn"><span class="btn-label">暂停</span></button>
     <button id="btn-orbits" class="hud-btn is-on">轨道线</button>
     <button id="btn-glow" class="hud-btn is-on">辉光</button>

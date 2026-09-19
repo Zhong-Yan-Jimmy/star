@@ -29,18 +29,38 @@
     hovered: null,
     focusRef: null,
     focusPhase: 'idle',   // idle | moving | locked
-    booted: false
+    booted: false,
+    mode: 'solar',        // solar | star
+    switching: false
+  };
+
+  /* 两个模式各自的相机参数与初始机位。
+     near / far 刻意不在这里：恒星模式近处 3 单位起步、最远 125 单位，
+     太阳系那套 0.1 / 4000 的视锥富余得多，动它只会白白引入深度精度问题。 */
+  const MODE_VIEW = {
+    solar: { home: new THREE.Vector3(0, 55, 118), minDist: 1.1, maxDist: 620 },
+    star:  { home: new THREE.Vector3(0, 42, 96),  minDist: 3.0, maxDist: 400 }
   };
 
   let renderer, scene, camera, controls, composer, bloomPass, clock;
   let starField, starFieldFar, beltMesh;
   let sunRef = null;
+  let sunStarRef = null;       // 恒星世界里原点上的那个太阳标记
+  let worldSolar, worldStars;
 
   const planets = [];          // 行星运行时对象
   const moonRefs = [];         // 所有卫星运行时对象
-  const pickables = [];        // 可拾取目标
+  const pickables = [];        // 可拾取目标（太阳系）
+  const starPickables = [];    // 可拾取目标（恒星）
+  const STAR_REFS = [];        // 恒星运行时对象，与 NEARBY_STARS 一一对应
   const orbitLines = [];
   const beltData = [];
+
+  /* 拾取层。恒星那 141 个隐形拾取球扔在这一层上：相机只渲染 layer 0，
+     看不见它们；而射线看得见——three 的 Raycaster 本来就是按 layers 工作的。
+     这比给它们 opacity: 0 干净得多，透明对象照样要提交 drawcall，
+     141 个隐形球就是每帧 141 次白烧。 */
+  const PICK_LAYER = 2;
 
   // 复用的临时对象，避免在循环里频繁分配
   const _v1 = new THREE.Vector3();
@@ -52,6 +72,8 @@
   const _s = new THREE.Vector3();
 
   const raycaster = new THREE.Raycaster();
+  /* 默认只看 layer 0，得把拾取层显式打开，否则恒星那颗也点不中 */
+  raycaster.layers.enable(PICK_LAYER);
   const pointer = new THREE.Vector2(-10, -10);
   let pointerPx = { x: 0, y: 0 };
 
@@ -161,6 +183,17 @@
     scene.add(new THREE.AmbientLight(0x2c3f5e, 0.75));
   }
 
+  /* 两个世界各装进一个 Group。用 visible 切换而不是 add / remove：
+     行星的公转角、自转角、卫星轨道都留在对象上，切回来是接着走而不是
+     从头开始，也省掉一次一百多个对象的重建。
+     灯光和两片星空背景不进任何一组——那是两个模式共用的天幕。 */
+  function initWorlds() {
+    worldSolar = new THREE.Group();
+    worldStars = new THREE.Group();
+    worldStars.visible = false;
+    scene.add(worldSolar, worldStars);
+  }
+
   /* ============================================================
      四、星空背景
      ============================================================ */
@@ -232,7 +265,7 @@
   function createSun() {
     const d = SOLAR_SYSTEM.sun;
     const anchor = new THREE.Object3D();
-    scene.add(anchor);
+    worldSolar.add(anchor);
 
     const geo = new THREE.SphereGeometry(d.radius, 64, 48);
     const mat = new THREE.MeshBasicMaterial({
@@ -306,7 +339,7 @@
   function createPlanet(data) {
     // 公转容器：绕 Y 轴旋转，代表行星在轨道上的位置
     const orbitContainer = new THREE.Object3D();
-    scene.add(orbitContainer);
+    worldSolar.add(orbitContainer);
 
     // 锚点：位于轨道半径处，其世界坐标即行星中心
     const anchor = new THREE.Object3D();
@@ -504,7 +537,7 @@
   function createOrbits() {
     planets.forEach(p => {
       const line = createOrbitLine(p.data.orbit, p.data.color, p.data.dwarf ? 0.16 : 0.28);
-      scene.add(line);
+      worldSolar.add(line);
       orbitLines.push(line);
     });
   }
@@ -544,7 +577,7 @@
     // 先按初始角度铺好，避免第一帧之前所有实例堆在原点
     applyBeltMatrices();
 
-    scene.add(beltMesh);
+    worldSolar.add(beltMesh);
   }
 
   function applyBeltMatrices() {
@@ -562,7 +595,159 @@
   }
 
   /* ============================================================
-     八、纹理预生成（带进度回调）
+     八、邻近恒星世界
+     ============================================================ */
+
+  /* 赤道坐标 → 场景坐标。把天球赤道面摆成 XZ 平面、Y 轴指向北天极：
+     这样从太阳望出去，每颗星的方位与真实星空一致，星座的相对形状自然
+     成立。距离走幂律压缩，方向一个字节都不动。
+     ra 的单位是小时，乘 15 才是度 —— 这份数据最容易看走眼的一处。 */
+  function starPosition(s, out) {
+    const r = STAR_SCALE * Math.pow(s.dist, STAR_GAMMA);
+    const ra = s.ra * 15 * Math.PI / 180;
+    const dec = s.dec * Math.PI / 180;
+    const cd = Math.cos(dec);
+    /* 最后一项取负：赤经往东增加，而 three 里 +Z 指向观察者，
+       不取负的话从天极往下看天球会转反，星座左右镜像。 */
+    return out.set(r * cd * Math.cos(ra), r * Math.sin(dec), -r * cd * Math.sin(ra));
+  }
+
+  function magBucketOf(mag) {
+    const m = (mag === null || mag === undefined || !isFinite(mag)) ? Infinity : mag;
+    const i = STAR_MAG_BUCKETS.findIndex(b => m < b.max);
+    return i < 0 ? STAR_MAG_BUCKETS.length - 1 : i;
+  }
+
+  function buildStarWorld() {
+    /* 全项目最大的性能陷阱就在这一行：makeGlowTexture 是 256×256 的逐像素
+       循环，而且不缓存。给 141 颗星各调一次就是约 3700 万次像素运算、
+       几十 MB 的画布，会卡死好几秒。只调这一次，5 个 Points 和太阳辉光共用。 */
+    const glowTex = TexGen.makeGlowTexture([255, 255, 255], 2.2);
+    const c = new THREE.Color();
+    const hsl = { h: 0, s: 0, l: 0 };
+
+    /* PointsMaterial 的 size 是整组共用的而 vertexColors 是逐顶点的，
+       所以光谱色能进顶点色、星等不能进大小 —— 只能按星等分桶，一组一尺寸。
+       5 个桶 = 5 次 drawcall。 */
+    const groups = STAR_MAG_BUCKETS.map(() => []);
+    NEARBY_STARS.forEach(s => groups[magBucketOf(s.mag)].push(s));
+
+    groups.forEach((list, bi) => {
+      if (!list.length) return;
+      const cfg = STAR_MAG_BUCKETS[bi];
+      const pos = new Float32Array(list.length * 3);
+      const col = new Float32Array(list.length * 3);
+
+      list.forEach((s, k) => {
+        starPosition(s, _v1);
+        pos[k * 3] = _v1.x; pos[k * 3 + 1] = _v1.y; pos[k * 3 + 2] = _v1.z;
+
+        c.setHex(s.color);
+        /* 褐矮星的颜色本身就是暗红到近黑，落在深蓝底上就是一团看不见的
+           污渍。给亮度兜个底，保住「那儿确实有东西」这件事。 */
+        c.getHSL(hsl);
+        if (hsl.l < 0.36) c.setHSL(hsl.h, hsl.s, 0.36);
+        /* 桶内再按星等的残余量做 ±22% 亮度微调，把 5 级台阶抹成连续的：
+           桶里最亮的那个最亮，挨着下一档的暗一点，跨过桶边界看不出跳变。
+           mag 拿不到的按本桶最暗算 —— 不能让它变成 NaN 灌进顶点色。 */
+        const m = (s.mag === null || s.mag === undefined || !isFinite(s.mag)) ? cfg.max : s.mag;
+        const lo = bi === 0 ? -1.6 : STAR_MAG_BUCKETS[bi - 1].max;
+        const t = Math.min(Math.max((m - lo) / (cfg.max - lo), 0), 1);
+        c.multiplyScalar(1.22 - 0.44 * t);
+
+        col[k * 3] = c.r; col[k * 3 + 1] = c.g; col[k * 3 + 2] = c.b;
+      });
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+      worldStars.add(new THREE.Points(geo, new THREE.PointsMaterial({
+        size: cfg.size,
+        map: glowTex,
+        vertexColors: true,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true
+      })));
+    });
+
+    /* 每颗星配一个隐形拾取球。它们扔在 PICK_LAYER 上：相机只渲染 layer 0，
+       看不见；而 raycaster.layers 显式打开了这一层，看得见。这比给它们
+       opacity: 0 干净得多 —— 透明对象照样要提交 drawcall，141 个隐形球
+       就是每帧 141 次白烧。
+       球必须自己进扁平数组：intersectObjects(..., false) 是非递归的。 */
+    /* 半径 1.5 是拿屏幕像素定的：暗星的点在初始机位下只有 4 个像素宽，
+       拿它当靶子等于让人用针尖戳；1.5 的球在屏幕上约 15px 宽，
+       是「大概朝那儿点」就能中的尺寸，又不至于把旁边的星一起罩进来。
+       球不渲染，遮不住东西。 */
+    const hitGeo = new THREE.SphereGeometry(1.5, 8, 6);
+    const hitMat = new THREE.MeshBasicMaterial();
+
+    NEARBY_STARS.forEach(s => {
+      starPosition(s, _v1);
+      const anchor = new THREE.Object3D();
+      anchor.position.copy(_v1);
+      worldStars.add(anchor);
+
+      const hit = new THREE.Mesh(hitGeo, hitMat);
+      hit.layers.set(PICK_LAYER);
+      anchor.add(hit);
+
+      const ref = {
+        kind: 'star',
+        data: s,
+        anchor: anchor,
+        mesh: hit,
+        /* 恒星的「身体」是 5 个 Points 里的一个顶点，没有自己的网格和材质
+           可以点亮。setHovered 里原来那套改 emissive 的高亮在这儿无处落脚，
+           改走共用的 hover 环（见第十节）。 */
+        mat: null,
+        glow: null
+      };
+      hit.userData.ref = ref;
+      starPickables.push(hit);
+      STAR_REFS.push(ref);
+    });
+
+    /* 太阳在恒星世界里就是原点，得给它一个落点：否则「所有距离都从这里
+       量起」在画面里没有着落，左栏列表第一项也点不动。
+       用同一张辉光纹理染色，不再多调一次那个逐像素循环。 */
+    const sunData = Object.assign({}, SOLAR_SYSTEM.sun, { radius: 2.4 });
+    const sunAnchor = new THREE.Object3D();
+    worldStars.add(sunAnchor);
+
+    const sunGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowTex,
+      color: 0xffc46b,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    }));
+    /* 太阳是离我们最近的那颗恒星，在星野里该是最亮的；但它也不该亮成
+       一团糊住半个天球的雾 —— 它是这一百多颗里的一员，不是这个模式的主角 */
+    sunGlow.scale.setScalar(3.6);
+    sunAnchor.add(sunGlow);
+
+    const sunHit = new THREE.Mesh(new THREE.SphereGeometry(2.4, 12, 10), hitMat);
+    sunHit.layers.set(PICK_LAYER);
+    sunAnchor.add(sunHit);
+
+    sunStarRef = {
+      kind: 'star', data: sunData, anchor: sunAnchor,
+      mesh: sunHit, mat: null, glow: sunGlow
+    };
+    sunHit.userData.ref = sunStarRef;
+    starPickables.push(sunHit);
+
+    /* 射线用的是 matrixWorld，而它要到渲染时才更新，偏偏悬停检测跑在
+       渲染前面。不先算这一遍，第一帧所有拾取球都还堆在原点。 */
+    worldStars.updateMatrixWorld(true);
+  }
+
+  /* ============================================================
+     九、纹理预生成（带进度回调）
      ============================================================ */
 
   async function buildTextures(onProgress) {
@@ -589,7 +774,7 @@
   }
 
   /* ============================================================
-     九、交互：悬停与拾取
+     十、交互：悬停与拾取
      ============================================================ */
 
   function updatePointerFromEvent(e) {
@@ -599,31 +784,74 @@
     pointer.y = -(e.clientY / window.innerHeight) * 2 + 1;
   }
 
+  /* 拾取目标必须真的换数组，不能靠 worldSolar.visible = false 来屏蔽：
+     three 的 Raycaster 只测 layers、不看 object.visible（这是 #19475 里
+     明确移除的行为），藏起来的太阳系天体照样会被射线命中。
+     六处 pickables.push 分布在太阳 / 行星 / 卫星的构造函数里，全都不用动 ——
+     分流只在这一处读取点上做。 */
+  function activePickables() {
+    return state.mode === 'star' ? starPickables : pickables;
+  }
+
   function pickAtPointer() {
     raycaster.setFromCamera(pointer, camera);
-    const hits = raycaster.intersectObjects(pickables, false);
+    const hits = raycaster.intersectObjects(activePickables(), false);
     return hits.length ? hits[0].object.userData.ref : null;
   }
 
+  /* hover 环。恒星的「身体」是 5 个 Points 里的一个顶点，不属于任何一颗，
+     没有材质可以点亮（太阳系那边的做法是改 emissive）—— 所以改用一只共用
+     的光环挪过去。141 个环没必要，一个就够。 */
+  let hoverRing = null;
+
+  function createHoverRing() {
+    hoverRing = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: TexGen.makeGlowTexture([255, 255, 255], 1.15),
+      color: 0x5ee7ff,
+      transparent: true,
+      opacity: 0.8,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending
+    }));
+    hoverRing.visible = false;
+    /* 挂 scene 而不挂 worldStars：它是选中状态的一部分，跟天体属于哪个
+       世界无关。切模式时由 applyMode 里的 setHovered(null) 收掉。 */
+    scene.add(hoverRing);
+  }
+
+  /* 名字和光标只看「有没有悬停到东西」，高亮是另一回事。
+     原来这两件事被绑在 ref.mat.emissive 上（`if (ref && ref.mat && ...)`），
+     于是没有 emissive 的太阳既不出名字、光标也不变手型 —— 恒星更没有，
+     一整个模式都点不出反应。拆开之后两边都好了。 */
   function setHovered(ref) {
     if (state.hovered === ref) return;
 
-    // 还原上一个（太阳用的是 MeshBasicMaterial，没有 emissive）
-    if (state.hovered && state.hovered.mat && state.hovered.mat.emissive) {
-      state.hovered.mat.emissive.setHex(0x000000);
-    }
+    const prev = state.hovered;
+    if (prev && prev.mat && prev.mat.emissive) prev.mat.emissive.setHex(0x000000);
+    if (hoverRing) hoverRing.visible = false;
 
     state.hovered = ref;
 
-    if (ref && ref.mat && ref.mat.emissive) {
-      // 微微自发光，配合 bloom 形成一圈淡淡的描边
-      ref.mat.emissive.setHex(0x1d3d5c);
-      dom.tooltip.textContent = ref.data.name + (ref.data.en && ref.data.en !== ref.data.name ? ' · ' + ref.data.en : '');
-      dom.tooltip.classList.add('is-visible');
-      dom.canvas.style.cursor = 'pointer';
-    } else {
+    if (!ref) {
       dom.tooltip.classList.remove('is-visible');
       dom.canvas.style.cursor = 'grab';
+      return;
+    }
+
+    dom.tooltip.textContent = ref.data.name +
+      (ref.data.en && ref.data.en !== ref.data.name ? ' · ' + ref.data.en : '');
+    dom.tooltip.classList.add('is-visible');
+    dom.canvas.style.cursor = 'pointer';
+
+    if (ref.mat && ref.mat.emissive) {
+      // 微微自发光，配合 bloom 形成一圈淡淡的描边
+      ref.mat.emissive.setHex(0x1d3d5c);
+    } else if (hoverRing) {
+      // 光环大小跟着那颗星的显示尺寸走，不然暗星套个环反而比星还亮
+      worldPosOf(ref, _v1);
+      hoverRing.position.copy(_v1);
+      hoverRing.scale.setScalar(Math.max(ref.data.radius * 2.4, 2.2));
+      hoverRing.visible = true;
     }
   }
 
@@ -654,7 +882,7 @@
   }
 
   /* ============================================================
-     十、相机聚焦与跟随
+     十一、相机聚焦与跟随
      ============================================================ */
 
   const _prevFocusPos = new THREE.Vector3();
@@ -704,7 +932,112 @@
   }
 
   /* ============================================================
-     十一、信息面板
+     十二、模式切换
+     ============================================================ */
+
+  /* 换场放在拉远的中点做：那一刻画面里没有静止的参照物，
+     两个世界的显隐差异看不出接缝。三段式——拉远、换场、推近。 */
+  const _sw = {
+    active: false, phase: 0, t: 0, mode: null,
+    from: new THREE.Vector3(),
+    mid: new THREE.Vector3(),
+    to: new THREE.Vector3()
+  };
+
+  function switchMode(mode) {
+    /* 三个守卫缺一不可：入场动画期间相机正被另一段补间直接改着（boot 里
+       的 intro），此时插进来两段补间会抢同一个 camera.position。 */
+    if (state.switching || !state.booted || mode === state.mode) return;
+    const view = MODE_VIEW[mode];
+    if (!view) return;
+
+    state.switching = true;
+    /* 带阻尼的 OrbitControls 会拿内部球坐标把相机拽回去，和手写补间直接
+       打架。boot 的入场动画用的是同一招。 */
+    controls.enabled = false;
+
+    _sw.from.copy(camera.position);
+    _sw.mode = mode;
+    _sw.phase = 0;
+    _sw.t = 0;
+
+    /* 沿当前视线方向退到远处，中途把 y 抬起来画一道浅弧 ——
+       直线后退会从太阳本体里穿过去。 */
+    const axis = _sw.from.lengthSq() < 1e-6
+      ? new THREE.Vector3(0, 0.6, 1).normalize()
+      : _sw.from.clone().normalize();
+    const far = Math.max(_sw.from.length(), view.home.length()) * 2.4;
+    _sw.mid.copy(axis.multiplyScalar(far));
+    _sw.mid.y = Math.max(_sw.mid.y, far * 0.42);
+    _sw.to.copy(view.home);
+
+    _sw.active = true;
+  }
+
+  function updateSwitch(dt) {
+    if (!_sw.active) return;
+    _sw.t += dt;
+
+    if (_sw.phase === 0) {
+      camera.position.lerpVectors(_sw.from, _sw.mid, easeInOutCubic(Math.min(_sw.t / 0.5, 1)));
+      camera.lookAt(0, 0, 0);
+      if (_sw.t >= 0.5) {
+        applyMode(_sw.mode);
+        _sw.phase = 1;
+        _sw.t = 0;
+        _sw.from.copy(camera.position);
+      }
+      return;
+    }
+
+    camera.position.lerpVectors(_sw.from, _sw.to, easeInOutCubic(Math.min(_sw.t / 0.75, 1)));
+    camera.lookAt(0, 0, 0);
+    if (_sw.t >= 0.75) {
+      _sw.active = false;
+      controls.target.set(0, 0, 0);
+      controls.enabled = true;
+      controls.update();
+      state.switching = false;
+    }
+  }
+
+  /** 换场：同一帧里把该改的都改完 */
+  function applyMode(mode) {
+    state.mode = mode;
+
+    worldSolar.visible = mode === 'solar';
+    worldStars.visible = mode === 'star';
+
+    /* 内层假星场在恒星模式必须藏起来：真星最远才 125 单位，而假星铺在
+       420–900 的球壳上，两者会混进同一片天区，「每颗星的方位都与真实星空
+       一致」这件事就说不清了。外层那圈银河带留着当深空底。 */
+    if (starField) starField.visible = mode === 'solar';
+
+    const view = MODE_VIEW[mode];
+    controls.minDistance = view.minDist;
+    controls.maxDistance = view.maxDist;
+
+    setHovered(null);
+    closeInfo();
+    releaseFocus();
+
+    /* 列表换榜放在换场的中点：那一刻画面里没有静止参照物，一行行文字
+       当着人面重排会很难看。这里也顺手把上一条选中项的清空做了 ——
+       closeInfo 清的是旧榜上的 .is-active，旧榜这会儿已经被换掉了。 */
+    renderList(mode === 'solar' ? solarListItems() : starListItems());
+
+    if (dom.btnMode) {
+      dom.btnMode.textContent = mode === 'solar' ? '邻近恒星' : '返回太阳系';
+    }
+    if (dom.listLabel) {
+      const span = dom.listLabel.querySelector('span');
+      if (span) span.textContent = mode === 'solar' ? '天体索引 / INDEX' : '邻近恒星 / NEARBY';
+    }
+    if (dom.listCredit) dom.listCredit.hidden = mode !== 'star';
+  }
+
+  /* ============================================================
+     十三、信息面板
      ============================================================ */
 
   let activeRef = null;
@@ -779,10 +1112,10 @@
   }
 
   /* ============================================================
-     十二、左侧天体列表
+     十四、左侧天体列表
      ============================================================ */
 
-  function buildList() {
+  function solarListItems() {
     const items = [];
 
     items.push({
@@ -820,6 +1153,42 @@
       }
     });
 
+    return items;
+  }
+
+  function starListItems() {
+    const items = [];
+
+    /* 太阳排在最前。恒星模式里所有距离都从它量起，它自己不在这张表上的话，
+       「4.23 光年」这个数字就没有起点。用太阳系那份 data —— 点开是同
+       一份档案，这也是对的。 */
+    items.push({
+      ref: sunStarRef,
+      id: SOLAR_SYSTEM.sun.id,
+      name: SOLAR_SYSTEM.sun.name,
+      en: SOLAR_SYSTEM.sun.en,
+      type: '0 ly',
+      color: '#ffd27a'
+    });
+
+    /* 顺序直接沿用 NEARBY_STARS 的顺序（按距离升序）。这里不做 .sort() ——
+       排序必须在产出 items 之前就完成，理由见 renderList 上那段。 */
+    STAR_REFS.forEach(ref => {
+      const s = ref.data;
+      items.push({
+        ref: ref,
+        id: s.id,
+        name: s.name,
+        en: s.en,
+        type: s.dist.toFixed(2) + ' ly',
+        color: '#' + new THREE.Color(s.color).getHexString()
+      });
+    });
+
+    return items;
+  }
+
+  function renderList(items) {
     dom.planetList.innerHTML = items.map(it =>
       '<button class="p-item' + (it.child ? ' is-child' : '') + (it.dwarf ? ' is-dwarf' : '') + '" data-id="' + it.id + '">' +
         '<span class="p-dot" style="--c:' + it.color + '"></span>' +
@@ -828,6 +1197,11 @@
       '</button>'
     ).join('');
 
+    /* 下面这两段是本文件最脆的一处：点击绑定读的是 items[i]，而下标来自
+       querySelectorAll 的顺序 —— 两者必须严格一一对应，所以中间不许插
+       任何东西。插一次过滤、一个条件渲染，下标就错位，点「火星」会打开
+       木星。items 的排序也必须在进这个函数之前就做完：在这儿 sort 一次，
+       绑定就全对错人了。 */
     dom.listItems = dom.planetList.querySelectorAll('.p-item');
     Array.prototype.forEach.call(dom.listItems, (el, i) => {
       el.addEventListener('click', () => {
@@ -836,13 +1210,29 @@
         focusOn(target);
       });
     });
+
+    // 换榜要回到顶部，否则会继承上一份的滚动位置
+    dom.planetList.scrollTop = 0;
   }
 
   /* ============================================================
-     十三、动画主循环
+     十五、动画主循环
      ============================================================ */
 
   function updateBodies(dt) {
+    // 星空背景两个模式共用，永远转
+    if (starField) {
+      starField.rotation.y += 0.0035 * dt;
+      starFieldFar.rotation.y -= 0.0018 * dt;
+    }
+
+    /* 恒星模式下把太阳系整个冻住：1400 个碎石实例每帧重算矩阵纯属白烧，
+       而且切回来会发现行星全跑到别处去了，不如原样停在那里。
+       注意 worldStars 本身绝对不能自转 —— 真实星空靠的就是「每颗星的方位
+       与天球坐标一致」，一转，星座的相对位置就全废了。这是全项目唯一一处
+       不能照搬星场惯例的地方。 */
+    if (state.mode !== 'solar') return;
+
     const step = state.paused ? 0 : dt * state.timeScale;
 
     // 太阳自转
@@ -875,12 +1265,6 @@
       }
       applyBeltMatrices();
     }
-
-    // 星空极缓慢自转，制造沉浸感
-    if (starField) {
-      starField.rotation.y += 0.0035 * dt;
-      starFieldFar.rotation.y -= 0.0018 * dt;
-    }
   }
 
   function updateHover() {
@@ -891,6 +1275,7 @@
 
   /** 相机越靠近太阳，辉光越收敛，否则贴近时整屏都会泛白 */
   function updateSunGlow() {
+    if (state.mode !== 'solar') return;   // 太阳藏起来了，辉光跟着停
     if (!sunRef || !sunRef.glows) return;
     const dist = camera.position.length();
     const fade = Math.max(0.20, Math.min(1, (dist - 5) / 68));
@@ -907,6 +1292,7 @@
     const dt = Math.min(clock.getDelta(), 0.05);
 
     updateBodies(dt);
+    updateSwitch(dt);
     updateFocus(dt);
     updateSunGlow();
     if (controls.enabled) controls.update();
@@ -926,7 +1312,7 @@
   }
 
   /* ============================================================
-     十四、尺寸变化
+     十六、尺寸变化
      ============================================================ */
 
   function onResize() {
@@ -939,7 +1325,7 @@
   }
 
   /* ============================================================
-     十五、UI 绑定
+     十七、UI 绑定
      ============================================================ */
 
   let dragMoved = false;
@@ -972,11 +1358,17 @@
       if (bloomPass) bloomPass.enabled = state.bloomOn;
     });
 
+    // 切换模式
+    dom.btnMode.addEventListener('click', () => {
+      switchMode(state.mode === 'solar' ? 'star' : 'solar');
+    });
+
     // 重置视角
     dom.btnReset.addEventListener('click', () => {
       releaseFocus();
       closeInfo();
-      camera.position.set(0, 55, 118);
+      // 机位要读当前模式的：写死太阳系那套的话，在恒星模式点重置会被弹回去
+      camera.position.copy(MODE_VIEW[state.mode].home);
       controls.target.set(0, 0, 0);
       controls.update();
     });
@@ -1029,14 +1421,15 @@
   }
 
   /* ============================================================
-     十六、启动
+     十八、启动
      ============================================================ */
 
   async function boot() {
     [
       'scene', 'loading', 'loading-bar', 'loading-label', 'loading-pct',
       'tooltip', 'planet-list', 'info', 'info-body', 'btn-close-info',
-      'btn-pause', 'btn-reset', 'btn-orbits', 'btn-glow',
+      'btn-pause', 'btn-reset', 'btn-orbits', 'btn-glow', 'btn-mode', 'list-label',
+      'list-credit',
       'speed-range', 'speed-value', 'follow', 'follow-name'
     ].forEach(id => {
       const camel = id.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -1048,6 +1441,7 @@
     initRenderer();
     initComposer();
     initLights();
+    initWorlds();
 
     // 先造星空，加载过程中也有东西可看
     createStarField();
@@ -1062,17 +1456,21 @@
     SOLAR_SYSTEM.planets.forEach(createPlanet);
     createOrbits();
     createAsteroidBelt();
+    buildStarWorld();
+    createHoverRing();
 
-    buildList();
+    renderList(solarListItems());
     bindUI();
 
     dom.loading.classList.add('is-done');
 
-    // 入场：相机从远处缓缓推近，期间锁住交互，避免与动画打架
+    /* 入场：相机从远处缓缓推近，期间锁住交互，避免与动画打架。
+       模式按钮也要一起锁 —— 入场期间它和 intro 补间会抢同一个 camera.position */
     const from = new THREE.Vector3(0, 175, 380);
-    const to = new THREE.Vector3(0, 55, 118);
+    const to = MODE_VIEW.solar.home.clone();
     camera.position.copy(from);
     controls.enabled = false;
+    dom.btnMode.disabled = true;
 
     const introMs = 2200;
     const t0 = performance.now();
@@ -1089,10 +1487,23 @@
         controls.enabled = true;
         controls.update();
         state.booted = true;
+        dom.btnMode.disabled = false;
       }
     })();
 
     animate();
+
+    /* 给 tools/check-page.mjs 用。相机参数、模式状态、拾取列表全在这个 IIFE
+       的闭包里，不暴露的话检查脚本只能靠截图猜 —— 比如 controls.maxDistance
+       换没换，从外面根本看不出来。暴露的成本是零。 */
+    window.__solaris = {
+      state, camera, controls, scene, worldSolar, worldStars,
+      planets, sunRef, activePickables, switchMode, MODE_VIEW,
+      stars: NEARBY_STARS,
+      starRefs: STAR_REFS, starPickables, sunStarRef, starPosition,
+      STAR_SCALE, STAR_GAMMA,
+      ring: () => hoverRing
+    };
   }
 
   /* ---------------- Gamma 校正着色器 ---------------- */

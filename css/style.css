@@ -258,9 +258,17 @@ html, body {
   box-shadow: 0 0 9px var(--c);
 }
 
-.p-name { white-space: nowrap; }
+/* 恒星列表里有「斯特鲁维 2398 A」这种长名字，224px 的栏宽下必须能截断。
+   太阳系那批名字都短，触发不到，所以这是纯安全改动 */
+.p-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .p-type {
+  flex: 0 0 auto;
   margin-left: auto;
   font-family: var(--font-mono);
   font-size: 9.5px;
@@ -268,6 +276,20 @@ html, body {
   opacity: 0.45;
   white-space: nowrap;
 }
+
+/* 恒星数据的署名。HYG 是 CC BY-SA 4.0，署名是许可条件的一部分 */
+.list-credit {
+  padding: 8px 15px 10px;
+  border-top: 1px solid rgba(94, 231, 255, 0.14);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  line-height: 1.6;
+  color: var(--text-dim);
+  opacity: 0.45;
+}
+
+.list-credit[hidden] { display: none; }
 
 /* ---------------- 右上：控制台 ---------------- */
 
@@ -364,6 +386,24 @@ input[type="range"]::-moz-range-thumb {
   color: var(--cyan);
   text-shadow: 0 0 12px rgba(94, 231, 255, 0.7);
   box-shadow: inset 0 0 18px rgba(94, 231, 255, 0.13);
+}
+
+/* 模式切换横跨整行。它换掉的是整个视野，不是又一项显示开关 */
+.hud-btn.is-wide {
+  grid-column: 1 / -1;
+  letter-spacing: 0.14em;
+}
+
+/* 入场动画期间锁住模式按钮：那段补间也在直接改 camera.position */
+.hud-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.hud-btn:disabled:hover {
+  background: rgba(94, 231, 255, 0.05);
+  border-color: rgba(94, 231, 255, 0.22);
+  color: var(--text-dim);
 }
 
 /* ---------------- 右侧：天体档案 ---------------- */
@@ -842,7 +882,33 @@ a.info-action {
 }
 
 @media (max-width: 820px) {
-  .hud-left { display: none; }
+  /* 左栏整个收起，但 HYG 的署名挂在它里面，而署名是 CC BY-SA 4.0 的
+     许可条件之一，不能跟着一起消失。所以不 display: none，改成收成一个
+     空壳：去掉背板、描边和 clip-path（clip-path 会连后代一起裁掉），
+     只把署名挪到底部提示的上方单独站着。
+     display: none 的子树整个不生成盒子，里面写 position: fixed 也没用 ——
+     这就是不能直接藏父元素的原因。 */
+  .hud-left {
+    top: auto;
+    bottom: 52px;
+    left: 18px;
+    width: auto;
+    max-height: none;
+    background: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    filter: none;
+    clip-path: none;
+  }
+  .hud-left::before { display: none; }
+  .hud-left .panel-label,
+  .hud-left .planet-list { display: none; }
+  .list-credit {
+    padding: 0;
+    border-top: 0;
+    opacity: 0.55;   /* 窄屏下它是唯一一处署名，比桌面版看得清一点 */
+  }
+
   .hud-title { top: 18px; left: 18px; }
   .title-text h1 { font-size: 20px; }
   .title-text p { display: none; }
